@@ -40,10 +40,10 @@ app.options('*', cors(corsOptions)); // handle ALL preflight requests
 // ── Helmet (after CORS so it doesn't override CORS headers) ─────────
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
-// ── Rate limiting ────────────────────────────────────────────────────
+// ── Rate limiting (company auth only — admin has its own brute force logic) ──
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10,
+  max: 15,
   message: { success: false, message: 'Too many login attempts. Please try again in 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
@@ -68,7 +68,7 @@ app.get('/api/health', (req, res) => {
 
 // ── Routes ───────────────────────────────────────────────────────────
 app.use('/api/auth', loginLimiter, authRoutes);
-app.use('/api/admin', loginLimiter, adminRoutes);
+app.use('/api/admin', adminRoutes);
 
 // ── 404 handler ──────────────────────────────────────────────────────
 app.use('*', (req, res) => {

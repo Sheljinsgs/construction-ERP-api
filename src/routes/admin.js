@@ -5,34 +5,87 @@ const { body, validationResult } = require('express-validator');
 
 const router = express.Router();
 
-// ── Mock super admins DB (replace with real DB later) ────────────────
-const SUPER_ADMINS = [
-  {
-    id: 'sa001',
-    email: 'superadmin@constructerp.com',
-    passwordHash: bcrypt.hashSync('SuperAdmin@123', 10),
-    name: 'System Administrator',
-    level: 'GLOBAL',
-    nodeAccess: 'ALL',
-    ipWhitelist: [],
-  },
-  {
-    id: 'sa002',
-    email: 'admin@apexbuild.com',
-    passwordHash: bcrypt.hashSync('ApexAdmin2024', 10),
-    name: 'Apex Build Admin',
-    level: 'ENTERPRISE',
-    nodeAccess: 'APEXBUILD',
-    ipWhitelist: [],
-  },
-];
+// ── Super Admin Credential Store ─────────────────────────────────────
+// Single super admin — username: Superadmin / password: Superadmin@123
+const SUPER_ADMIN = {
+  id: 'sa001',
+  username: 'Superadmin',
+  passwordHash: bcrypt.hashSync('Superadmin@123', 12),
+  name: 'System Administrator',
+  level: 'GLOBAL',
+  nodeAccess: 'ALL',
+  createdAt: '2024-01-01T00:00:00Z',
+};
+
+// ── Login attempt tracker (in-memory, replace with Redis in production) ──
+const loginAttempts = new Map(); // key: IP, value: { count, lastAttempt, lockedUntil }
+const MAX_ATTEMPTS = 5;
+const LOCK_DURATION_MS = 15 * 60 * 1000; // 15 min lockout
+
+function checkBruteForce(ip) {
+  const record = loginAttempts.get(ip);
+  if (!record) return { blocked: false };
+  if (record.lockedUntil && Date.now() < record.lockedUntil) {
+    const remainSec = Math.ceil((record.lockedUntil - Date.now()) / 1000);
+    return { blocked: true, remainSec };
+  }
+  if (record.lockedUntil && Date.now() >= record.lockedUntil) {
+    loginAttempts.delete(ip);
+    return { blocked: false };
+  }
+  return { blocked: false };
+}
+
+function recordFailedAttempt(ip) {
+  const record = loginAttempts.get(ip) || { count: 0, lastAttempt: null, lockedUntil: null };
+  record.count += 1;
+  record.lastAttempt = Date.now();
+  if (record.count >= MAX_ATTEMPTS) {
+    record.lockedUntil = Date.now() + LOCK_DURATION_MS;
+    console.warn(`[ADMIN SECURITY] IP ${ip} locked out after ${MAX_ATTEMPTS} failed attempts.`);
+  }
+  loginAttempts.set(ip, record);
+}
+
+function clearAttempts(ip) {
+  loginAttempts.delete(ip);
+}
+
+// ── JWT Auth Middleware ──────────────────────────────────────────────
+function requireAdminAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required. No token provided.',
+    });
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.role !== 'super_admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden. Super Admin privileges required.',
+      });
+    }
+    req.admin = decoded;
+    next();
+  } catch (err) {
+    const message = err.name === 'TokenExpiredError'
+      ? 'Session expired. Please log in again.'
+      : 'Invalid session token. Access denied.';
+    return res.status(401).json({ success: false, message });
+  }
+}
 
 // ── POST /api/admin/login ────────────────────────────────────────────
 router.post(
   '/login',
   [
-    body('email').isEmail().withMessage('Valid administrator email is required.'),
-    body('password').isLength({ min: 6 }).withMessage('Access key must be at least 6 characters.'),
+    body('username').trim().notEmpty().withMessage('Username is required.'),
+    body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters.'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -40,64 +93,84 @@ router.post(
       return res.status(422).json({ success: false, errors: errors.array() });
     }
 
-    const { email, password, stayVerified } = req.body;
+    const { username, password, stayVerified } = req.body;
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'Unknown';
+
+    // Check brute force lockout
+    const bruteCheck = checkBruteForce(clientIp);
+    if (bruteCheck.blocked) {
+      console.warn(`[ADMIN SECURITY] Blocked login attempt from locked IP: ${clientIp}`);
+      return res.status(429).json({
+        success: false,
+        message: `Account locked due to multiple failed attempts. Try again in ${Math.ceil(bruteCheck.remainSec / 60)} minute(s).`,
+        locked: true,
+        retryAfterSec: bruteCheck.remainSec,
+      });
+    }
 
     try {
-      const admin = SUPER_ADMINS.find(
-        (a) => a.email.toLowerCase() === email.toLowerCase()
-      );
-
-      if (!admin) {
-        console.warn(`[ADMIN SECURITY] Failed login attempt for email: ${email} from IP: ${clientIp}`);
+      // Check username (case-sensitive)
+      if (username !== SUPER_ADMIN.username) {
+        recordFailedAttempt(clientIp);
+        console.warn(`[ADMIN SECURITY] Failed login — invalid username: "${username}" from IP: ${clientIp}`);
         return res.status(401).json({
           success: false,
-          message: 'Access denied. Unauthorized administrator credentials.',
+          message: 'Access denied. Invalid credentials. This attempt has been logged.',
           logged: true,
         });
       }
 
-      const isMatch = await bcrypt.compare(password, admin.passwordHash);
+      // Check password
+      const isMatch = await bcrypt.compare(password, SUPER_ADMIN.passwordHash);
       if (!isMatch) {
-        console.warn(`[ADMIN SECURITY] Wrong password for admin: ${email} from IP: ${clientIp}`);
+        recordFailedAttempt(clientIp);
+        console.warn(`[ADMIN SECURITY] Failed login — wrong password for "${username}" from IP: ${clientIp}`);
         return res.status(401).json({
           success: false,
-          message: 'Access denied. Invalid access key. This attempt has been logged.',
+          message: 'Access denied. Invalid credentials. This attempt has been logged.',
           logged: true,
         });
       }
+
+      // Successful login — clear any failed attempts
+      clearAttempts(clientIp);
 
       // Generate privileged JWT
+      // stayVerified: true → 7 days, false → 4 hours
+      const expiresIn = stayVerified ? '7d' : '4h';
       const token = jwt.sign(
         {
-          id: admin.id,
+          id: SUPER_ADMIN.id,
           role: 'super_admin',
-          level: admin.level,
-          nodeAccess: admin.nodeAccess,
-          email: admin.email,
-          name: admin.name,
+          level: SUPER_ADMIN.level,
+          nodeAccess: SUPER_ADMIN.nodeAccess,
+          username: SUPER_ADMIN.username,
+          name: SUPER_ADMIN.name,
         },
         process.env.JWT_SECRET,
-        { expiresIn: stayVerified ? '24h' : '4h' }
+        { expiresIn }
       );
 
-      console.log(`[ADMIN AUTH] Super Admin login: ${admin.name} (${admin.email}) from IP: ${clientIp} at ${new Date().toISOString()}`);
+      console.log(`[ADMIN AUTH] ✅ Super Admin login: ${SUPER_ADMIN.name} from IP: ${clientIp} at ${new Date().toISOString()} | Session: ${expiresIn}`);
 
       return res.json({
         success: true,
-        message: 'Safe session initialized. Welcome, Administrator.',
+        message: 'Secure session initialized. Welcome, Administrator.',
         token,
         admin: {
-          id: admin.id,
-          name: admin.name,
-          email: admin.email,
-          level: admin.level,
-          nodeAccess: admin.nodeAccess,
+          id: SUPER_ADMIN.id,
+          name: SUPER_ADMIN.name,
+          username: SUPER_ADMIN.username,
+          level: SUPER_ADMIN.level,
+          nodeAccess: SUPER_ADMIN.nodeAccess,
         },
         sessionInfo: {
           ip: clientIp,
+          userAgent,
           initTime: new Date().toISOString(),
-          expiresIn: stayVerified ? '24h' : '4h',
+          expiresIn,
+          stayVerified: !!stayVerified,
         },
       });
     } catch (err) {
@@ -107,8 +180,37 @@ router.post(
   }
 );
 
-// ── GET /api/admin/platform-stats ────────────────────────────────
-router.get('/platform-stats', (req, res) => {
+// ── GET /api/admin/verify-session ────────────────────────────────────
+// Called on page load to check if existing token is still valid
+router.get('/verify-session', requireAdminAuth, (req, res) => {
+  return res.json({
+    success: true,
+    message: 'Session is valid.',
+    admin: {
+      id: req.admin.id,
+      name: req.admin.name,
+      username: req.admin.username,
+      level: req.admin.level,
+      nodeAccess: req.admin.nodeAccess,
+    },
+    session: {
+      issuedAt: new Date(req.admin.iat * 1000).toISOString(),
+      expiresAt: new Date(req.admin.exp * 1000).toISOString(),
+    },
+  });
+});
+
+// ── POST /api/admin/logout ───────────────────────────────────────────
+router.post('/logout', requireAdminAuth, (req, res) => {
+  console.log(`[ADMIN AUTH] 🔓 Super Admin logout: ${req.admin.name} at ${new Date().toISOString()}`);
+  // In production: blacklist token via Redis
+  return res.json({ success: true, message: 'Session terminated successfully.' });
+});
+
+// ── Protected Routes (require auth) ─────────────────────────────────
+
+// GET /api/admin/platform-stats
+router.get('/platform-stats', requireAdminAuth, (req, res) => {
   res.json({
     success: true,
     stats: {
@@ -128,8 +230,8 @@ router.get('/platform-stats', (req, res) => {
   });
 });
 
-// ── GET /api/admin/companies ──────────────────────────────────────
-router.get('/companies', (req, res) => {
+// GET /api/admin/companies
+router.get('/companies', requireAdminAuth, (req, res) => {
   res.json({
     success: true,
     companies: [
@@ -142,8 +244,8 @@ router.get('/companies', (req, res) => {
   });
 });
 
-// ── GET /api/admin/recent-activity ───────────────────────────────
-router.get('/recent-activity', (req, res) => {
+// GET /api/admin/recent-activity
+router.get('/recent-activity', requireAdminAuth, (req, res) => {
   res.json({
     success: true,
     activities: [
@@ -156,8 +258,8 @@ router.get('/recent-activity', (req, res) => {
   });
 });
 
-// ── GET /api/admin/support-tickets ───────────────────────────────
-router.get('/support-tickets', (req, res) => {
+// GET /api/admin/support-tickets
+router.get('/support-tickets', requireAdminAuth, (req, res) => {
   res.json({
     success: true,
     breakdown: [
@@ -171,3 +273,4 @@ router.get('/support-tickets', (req, res) => {
 });
 
 module.exports = router;
+
